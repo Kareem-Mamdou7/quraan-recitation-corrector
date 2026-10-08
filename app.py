@@ -1,12 +1,12 @@
 from pathlib import Path
 from dataclasses import dataclass
 
-import librosa
 import torch
-from transformers import AutoProcessor, AutoModelForCTC
+import soundfile as sf
+from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 MODEL_NAME = "TBOGamer22/wav2vec2-quran-phonetics"
@@ -16,10 +16,6 @@ AUDIO_FILE = BASE_DIR / "audio" / "test.wav"
 
 SAMPLE_RATE = 16000
 
-SURAH_ID = 1
-AYAH_ID = 2
-
-# Quran words
 REFERENCE_WORDS = [
     "al-ḥamdu",
     "lillahi",
@@ -27,7 +23,6 @@ REFERENCE_WORDS = [
     "l-ʿālamīna",
 ]
 
-# Arabic words corresponding to REFERENCE_WORDS
 WORD_LABELS_ARABIC = [
     "الْحَمْدُ",
     "لِلَّهِ",
@@ -35,246 +30,164 @@ WORD_LABELS_ARABIC = [
     "الْعَالَمِينَ",
 ]
 
-REFERENCE = "|".join(REFERENCE_WORDS)
 
-# Forced alignment is performed without word separators.
-ALIGNMENT_REFERENCE = "".join(REFERENCE_WORDS)
+# ============================================================
+# VERSION 6 SEGMENTATION SETTINGS
+# ============================================================
 
-WEAK_THRESHOLD = 0.50
-STRONG_THRESHOLD = 0.75
+WORD_DURATION_RANGES = [
+    (0.45, 1.10),
+    (0.45, 1.15),
+    (0.25, 0.75),
+    (1.00, None),  # Final word: flexible for madd
+]
+
+MAX_TRAILING_AUDIO = 0.35
 
 
 # ============================================================
-# DATA STRUCTURES
+# DATA CLASS
 # ============================================================
 
 
 @dataclass
-class TokenSegment:
-    token: str
+class WordBoundary:
+    word_index: int
+    word: str
+    arabic: str
+
     start_frame: int
     end_frame: int
+
     start_time: float
     end_time: float
-    confidence: float
+
+    duration: float
+    segmentation_score: float
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# HELPERS
 # ============================================================
 
 
-def frame_to_time(
-    frame: int,
-    frame_duration: float,
-) -> float:
+def word_to_token_ids(word, processor):
+
+    vocab = processor.tokenizer.get_vocab()
+
+    token_ids = []
+
+    for char in word:
+
+        if char not in vocab:
+            raise ValueError(
+                f"Character {char!r} from {word!r} " f"is not in the model vocabulary."
+            )
+
+        token_ids.append(vocab[char])
+
+    return token_ids
+
+
+def ctc_segment_score(
+    log_probs,
+    token_ids,
+    start_frame,
+    end_frame,
+    blank_id,
+):
+    """
+    CTC Viterbi score for a target word inside
+    a particular frame interval.
+    """
+
+    if end_frame <= start_frame:
+        return float("-inf")
+
+    segment = log_probs[start_frame:end_frame]
+
+    if segment.shape[0] < len(token_ids):
+        return float("-inf")
+
+    expanded = [blank_id]
+
+    for token in token_ids:
+        expanded.append(token)
+        expanded.append(blank_id)
+
+    states = len(expanded)
+
+    dp = torch.full(
+        (states,),
+        float("-inf"),
+        dtype=segment.dtype,
+        device=segment.device,
+    )
+
+    dp[0] = segment[0, blank_id]
+
+    if states > 1:
+        dp[1] = segment[0, expanded[1]]
+
+    for t in range(1, segment.shape[0]):
+
+        new_dp = torch.full_like(
+            dp,
+            float("-inf"),
+        )
+
+        for state in range(states):
+
+            best_previous = dp[state]
+
+            if state > 0:
+
+                best_previous = torch.maximum(
+                    best_previous,
+                    dp[state - 1],
+                )
+
+            if state > 1:
+
+                current_token = expanded[state]
+                previous_token = expanded[state - 2]
+
+                if current_token != blank_id and current_token != previous_token:
+
+                    best_previous = torch.maximum(
+                        best_previous,
+                        dp[state - 2],
+                    )
+
+            new_dp[state] = best_previous + segment[t, expanded[state]]
+
+        dp = new_dp
+
+    return torch.maximum(
+        dp[-1],
+        dp[-2],
+    ).item()
+
+
+def frame_to_seconds(
+    frame,
+    frame_duration,
+):
+
     return frame * frame_duration
 
 
-def similarity_score(
-    reference: str,
-    predicted: str,
-) -> tuple[int, float]:
-    """
-    Levenshtein edit distance.
-
-    Returns:
-        distance
-        similarity percentage
-    """
-
-    n = len(reference)
-    m = len(predicted)
-
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-
-    for i in range(n + 1):
-        dp[i][0] = i
-
-    for j in range(m + 1):
-        dp[0][j] = j
-
-    for i in range(1, n + 1):
-
-        for j in range(1, m + 1):
-
-            if reference[i - 1] == predicted[j - 1]:
-                cost = 0
-            else:
-                cost = 1
-
-            dp[i][j] = min(
-                dp[i - 1][j] + 1,
-                dp[i][j - 1] + 1,
-                dp[i - 1][j - 1] + cost,
-            )
-
-    distance = dp[n][m]
-
-    denominator = max(
-        n,
-        m,
-        1,
-    )
-
-    similarity = 1 - distance / denominator
-
-    return distance, similarity
-
-
-def edit_operations(
-    reference: str,
-    predicted: str,
+def decode_ctc(
+    logits,
+    processor,
+    blank_id,
 ):
     """
-    Returns:
-
-        MATCH
-        SUBSTITUTE
-        DELETE
-        INSERT
-    """
-
-    n = len(reference)
-    m = len(predicted)
-
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-
-    for i in range(n + 1):
-        dp[i][0] = i
-
-    for j in range(m + 1):
-        dp[0][j] = j
-
-    for i in range(1, n + 1):
-
-        for j in range(1, m + 1):
-
-            if reference[i - 1] == predicted[j - 1]:
-
-                dp[i][j] = dp[i - 1][j - 1]
-
-            else:
-
-                dp[i][j] = min(
-                    dp[i - 1][j - 1] + 1,
-                    dp[i - 1][j] + 1,
-                    dp[i][j - 1] + 1,
-                )
-
-    operations = []
-
-    i = n
-    j = m
-
-    while i > 0 or j > 0:
-
-        # ----------------------------------------------------
-        # MATCH
-        # ----------------------------------------------------
-
-        if (
-            i > 0
-            and j > 0
-            and reference[i - 1] == predicted[j - 1]
-            and dp[i][j] == dp[i - 1][j - 1]
-        ):
-
-            operations.append(
-                {
-                    "operation": "MATCH",
-                    "reference_index": i - 1,
-                    "predicted_index": j - 1,
-                    "reference_token": reference[i - 1],
-                    "predicted_token": predicted[j - 1],
-                }
-            )
-
-            i -= 1
-            j -= 1
-
-            continue
-
-        # ----------------------------------------------------
-        # SUBSTITUTE
-        # ----------------------------------------------------
-
-        if i > 0 and j > 0 and dp[i][j] == dp[i - 1][j - 1] + 1:
-
-            operations.append(
-                {
-                    "operation": "SUBSTITUTE",
-                    "reference_index": i - 1,
-                    "predicted_index": j - 1,
-                    "reference_token": reference[i - 1],
-                    "predicted_token": predicted[j - 1],
-                }
-            )
-
-            i -= 1
-            j -= 1
-
-            continue
-
-        # ----------------------------------------------------
-        # DELETE
-        # ----------------------------------------------------
-
-        if i > 0 and dp[i][j] == dp[i - 1][j] + 1:
-
-            operations.append(
-                {
-                    "operation": "DELETE",
-                    "reference_index": i - 1,
-                    "predicted_index": None,
-                    "reference_token": reference[i - 1],
-                    "predicted_token": None,
-                }
-            )
-
-            i -= 1
-
-            continue
-
-        # ----------------------------------------------------
-        # INSERT
-        # ----------------------------------------------------
-
-        if j > 0 and dp[i][j] == dp[i][j - 1] + 1:
-
-            operations.append(
-                {
-                    "operation": "INSERT",
-                    "reference_index": None,
-                    "predicted_index": j - 1,
-                    "reference_token": None,
-                    "predicted_token": predicted[j - 1],
-                }
-            )
-
-            j -= 1
-
-            continue
-
-        raise RuntimeError("Could not reconstruct edit operations.")
-
-    operations.reverse()
-
-    return operations
-
-
-def greedy_ctc_decode(
-    logits: torch.Tensor,
-    blank_id: int,
-    id_to_token: dict[int, str],
-    frame_duration: float,
-):
-    """
-    Standard greedy CTC decoding.
+    Greedy CTC decoding.
 
     Returns:
-        predicted string
-        token segments
+        decoded phonetic string
+        average confidence
     """
 
     probabilities = torch.softmax(
@@ -287,269 +200,202 @@ def greedy_ctc_decode(
         dim=-1,
     )
 
-    segments = []
+    best_confidences = torch.max(
+        probabilities,
+        dim=-1,
+    ).values
 
-    previous_raw_id = None
+    # CTC collapse
+    collapsed = []
 
-    active_id = None
-    active_start = None
-    active_frames = []
+    previous_id = None
 
-    for frame, token_id_tensor in enumerate(best_ids):
+    for token_id in best_ids.tolist():
 
-        token_id = int(token_id_tensor.item())
+        # Remove repeated tokens
+        if token_id == previous_id:
+            continue
 
-        # ----------------------------------------------------
-        # BLANK
-        # ----------------------------------------------------
+        previous_id = token_id
 
+        # Remove blank
         if token_id == blank_id:
-
-            if active_id is not None:
-
-                end_frame = frame
-
-                confidence = torch.tensor(active_frames).mean().item()
-
-                token = id_to_token.get(
-                    active_id,
-                    f"<UNK:{active_id}>",
-                )
-
-                segments.append(
-                    TokenSegment(
-                        token=token,
-                        start_frame=active_start,
-                        end_frame=end_frame,
-                        start_time=frame_to_time(
-                            active_start,
-                            frame_duration,
-                        ),
-                        end_time=frame_to_time(
-                            end_frame,
-                            frame_duration,
-                        ),
-                        confidence=confidence,
-                    )
-                )
-
-                active_id = None
-                active_start = None
-                active_frames = []
-
-            previous_raw_id = token_id
-
             continue
 
-        # ----------------------------------------------------
-        # SAME TOKEN AS PREVIOUS RAW FRAME
-        # ----------------------------------------------------
+        collapsed.append(token_id)
 
-        if token_id == previous_raw_id:
+    decoded = processor.tokenizer.decode(
+        collapsed,
+        group_tokens=False,
+    )
 
-            if active_id == token_id:
+    # Confidence of the frame-level predictions.
+    #
+    # This is NOT a word correctness probability.
+    # We only report it as an acoustic confidence indicator.
+    confidence = best_confidences.mean().item() * 100
 
-                active_frames.append(
-                    probabilities[
-                        frame,
-                        token_id,
-                    ].item()
-                )
+    return decoded, confidence
 
-            previous_raw_id = token_id
 
-            continue
+def normalize_phonetics(text):
+    """
+    Normalize spacing for comparison.
+    """
 
-        # ----------------------------------------------------
-        # NEW TOKEN
-        # ----------------------------------------------------
+    return text.replace(
+        " ",
+        "",
+    )
 
-        if active_id is not None:
 
-            end_frame = frame
+def levenshtein_distance(
+    a,
+    b,
+):
+    """
+    Character-level Levenshtein distance.
+    """
 
-            confidence = torch.tensor(active_frames).mean().item()
+    rows = len(a) + 1
+    cols = len(b) + 1
 
-            token = id_to_token.get(
-                active_id,
-                f"<UNK:{active_id}>",
+    dp = [[0] * cols for _ in range(rows)]
+
+    for i in range(rows):
+        dp[i][0] = i
+
+    for j in range(cols):
+        dp[0][j] = j
+
+    for i in range(1, rows):
+
+        for j in range(1, cols):
+
+            if a[i - 1] == b[j - 1]:
+
+                cost = 0
+
+            else:
+
+                cost = 1
+
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost,
             )
 
-            segments.append(
-                TokenSegment(
-                    token=token,
-                    start_frame=active_start,
-                    end_frame=end_frame,
-                    start_time=frame_to_time(
-                        active_start,
-                        frame_duration,
-                    ),
-                    end_time=frame_to_time(
-                        end_frame,
-                        frame_duration,
-                    ),
-                    confidence=confidence,
-                )
-            )
+    return dp[-1][-1]
 
-        active_id = token_id
-        active_start = frame
 
-        active_frames = [
-            probabilities[
-                frame,
-                token_id,
-            ].item()
-        ]
+def similarity_score(
+    reference,
+    detected,
+):
+    """
+    Simple normalized edit similarity.
 
-        previous_raw_id = token_id
+    This is NOT a Tajweed score.
+    """
 
-    # --------------------------------------------------------
-    # CLOSE FINAL TOKEN
-    # --------------------------------------------------------
+    reference = normalize_phonetics(reference)
 
-    if active_id is not None:
+    detected = normalize_phonetics(detected)
 
-        end_frame = len(best_ids)
+    if len(reference) == 0:
+        return 0.0
 
-        confidence = torch.tensor(active_frames).mean().item()
+    distance = levenshtein_distance(
+        reference,
+        detected,
+    )
 
-        token = id_to_token.get(
-            active_id,
-            f"<UNK:{active_id}>",
+    similarity = 1 - distance / len(reference)
+
+    return (
+        max(
+            0.0,
+            similarity,
         )
-
-        segments.append(
-            TokenSegment(
-                token=token,
-                start_frame=active_start,
-                end_frame=end_frame,
-                start_time=frame_to_time(
-                    active_start,
-                    frame_duration,
-                ),
-                end_time=frame_to_time(
-                    end_frame,
-                    frame_duration,
-                ),
-                confidence=confidence,
-            )
-        )
-
-    predicted = "".join(segment.token for segment in segments)
-
-    return predicted, segments
+        * 100
+    )
 
 
 # ============================================================
 # LOAD MODEL
 # ============================================================
 
-print("\nLoading Quran phoneme model...")
+print("=" * 90)
+print("LOADING MODEL")
+print("=" * 90)
 
-processor = AutoProcessor.from_pretrained(MODEL_NAME)
+processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
 
-model = AutoModelForCTC.from_pretrained(MODEL_NAME)
+model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME)
 
 model.eval()
 
-print("Model loaded.")
-
-tokenizer = processor.tokenizer
-
-vocab = tokenizer.get_vocab()
-
-id_to_token = {token_id: token for token, token_id in vocab.items()}
-
 blank_id = model.config.pad_token_id
 
-print(f"\nCTC blank ID: {blank_id}")
-
-print("\nReference:")
-print(REFERENCE)
-
-
-# ============================================================
-# VALIDATE REFERENCE
-# ============================================================
-
-for character in ALIGNMENT_REFERENCE:
-
-    if character not in vocab:
-
-        raise ValueError(
-            f"\nCharacter {character!r} "
-            "is not in the model vocabulary."
-            f"\nVocabulary: {vocab}"
-        )
-
-
-alignment_target_ids = [vocab[character] for character in ALIGNMENT_REFERENCE]
-
-print("\nAlignment reference:")
-print(ALIGNMENT_REFERENCE)
-
-print("\nAlignment token IDs:")
-print(alignment_target_ids)
+print(f"CTC blank ID: {blank_id}")
 
 
 # ============================================================
 # LOAD AUDIO
 # ============================================================
 
-if not AUDIO_FILE.exists():
+print()
+print("Loading audio...")
 
-    raise FileNotFoundError(f"\nAudio file not found:\n" f"{AUDIO_FILE}")
-
-
-print("\nLoading audio...")
-
-audio, sample_rate = librosa.load(
+audio, sample_rate = sf.read(
     AUDIO_FILE,
-    sr=SAMPLE_RATE,
-    mono=True,
+    dtype="float32",
 )
 
-duration = len(audio) / SAMPLE_RATE
+if audio.ndim > 1:
+    audio = audio.mean(axis=1)
+
+if sample_rate != SAMPLE_RATE:
+
+    raise ValueError(f"Expected {SAMPLE_RATE} Hz audio, " f"got {sample_rate} Hz.")
+
+audio_duration = len(audio) / sample_rate
 
 print(f"Audio:       {AUDIO_FILE.name}")
 
 print(f"Sample rate: {sample_rate} Hz")
 
-print(f"Duration:    {duration:.2f} seconds")
+print(f"Duration:    " f"{audio_duration:.2f} seconds")
 
 
 # ============================================================
-# RUN MODEL
+# RUN MODEL ON WHOLE AYAH
 # ============================================================
 
-print("\nRunning model...")
+print()
+print("Running model on whole ayah...")
 
-inputs = processor(
+whole_inputs = processor(
     audio,
     sampling_rate=SAMPLE_RATE,
     return_tensors="pt",
-    padding=True,
 )
 
-with torch.inference_mode():
+with torch.no_grad():
 
-    logits = model(
-        input_values=inputs.input_values,
-        attention_mask=inputs.attention_mask,
-    ).logits[0]
+    whole_outputs = model(
+        input_values=whole_inputs.input_values,
+    )
 
+whole_logits = whole_outputs.logits
 
-print(f"Logits shape: {tuple(logits.shape)}")
+whole_log_probs = torch.log_softmax(
+    whole_logits,
+    dim=-1,
+)[0]
 
-num_frames = logits.shape[0]
-
-print(f"Number of CTC frames: {num_frames}")
-
-
-# ============================================================
-# FRAME TIMING
-# ============================================================
+num_frames = whole_log_probs.shape[0]
 
 input_to_logits_ratio = getattr(
     model.config,
@@ -559,727 +405,466 @@ input_to_logits_ratio = getattr(
 
 frame_duration = input_to_logits_ratio / SAMPLE_RATE
 
+print(f"Logits shape: " f"{tuple(whole_logits.shape)}")
+
+print(f"Number of CTC frames: " f"{num_frames}")
+
 print(f"Frame duration: " f"{frame_duration * 1000:.2f} ms")
 
 
 # ============================================================
-# PART 1
-# UNCONSTRAINED CTC RECOGNITION
+# REFERENCE TOKEN IDS
 # ============================================================
 
-print("\n")
+print()
 print("=" * 90)
-print("1. UNCONSTRAINED CTC RECOGNITION")
+print("REFERENCE WORDS")
 print("=" * 90)
 
-print("\nThis is the model's actual greedy prediction.")
+word_token_ids = []
 
-predicted_text, predicted_segments = greedy_ctc_decode(
-    logits=logits,
-    blank_id=blank_id,
-    id_to_token=id_to_token,
-    frame_duration=frame_duration,
-)
+for i, word in enumerate(REFERENCE_WORDS):
 
-print("\nExpected:")
-print(REFERENCE)
+    token_ids = word_to_token_ids(
+        word,
+        processor,
+    )
 
-print("\nModel prediction:")
-print(predicted_text)
+    word_token_ids.append(token_ids)
+
+    print()
+    print(f"{i + 1}. " f"{WORD_LABELS_ARABIC[i]}")
+
+    print(f"   Phonetics: {word}")
+
+    print(f"   Token IDs: {token_ids}")
 
 
 # ============================================================
-# RECOGNIZED TOKEN SEGMENTS
+# DURATION RANGES IN FRAMES
 # ============================================================
 
-print("\n")
-print("Recognized phoneme segments:")
-print("-" * 90)
+duration_ranges_frames = []
 
-for segment in predicted_segments:
+for minimum_seconds, maximum_seconds in WORD_DURATION_RANGES:
 
-    if segment.token == "|":
-        token_type = "WORD"
+    minimum_frames = max(
+        1,
+        round(minimum_seconds / frame_duration),
+    )
+
+    if maximum_seconds is None:
+
+        maximum_frames = None
+
     else:
-        token_type = ""
 
-    print(
-        f"{segment.token:>4}   "
-        f"{segment.start_time:6.2f}s -> "
-        f"{segment.end_time:6.2f}s   "
-        f"{segment.confidence * 100:6.2f}%   "
-        f"{token_type}"
-    )
-
-
-# ============================================================
-# REMOVE WORD SEPARATORS
-# ============================================================
-
-predicted_phonemes = predicted_text.replace("|", "")
-
-reference_phonemes = ALIGNMENT_REFERENCE
-
-
-# ============================================================
-# PHONETIC SEQUENCE SIMILARITY
-# ============================================================
-
-distance, similarity = similarity_score(
-    reference_phonemes,
-    predicted_phonemes,
-)
-
-print("\n")
-print("=" * 90)
-print("PHONETIC SEQUENCE COMPARISON")
-print("=" * 90)
-
-print("\nReference phonemes:")
-print(reference_phonemes)
-
-print("\nModel phonemes:")
-print(predicted_phonemes)
-
-print(f"\nEdit distance: {distance}")
-
-print(f"Phonetic sequence similarity: " f"{similarity * 100:.2f}%")
-
-print("\nThis is a model-recognition similarity," "\nnot a Tajweed score.")
-
-
-# ============================================================
-# WORD SEPARATOR CHECK
-# ============================================================
-
-reference_separator_count = REFERENCE.count("|")
-predicted_separator_count = predicted_text.count("|")
-
-print("\n")
-print("=" * 90)
-print("WORD SEPARATOR CHECK")
-print("=" * 90)
-
-print(f"\nExpected word separators: " f"{reference_separator_count}")
-
-print(f"Model word separators:    " f"{predicted_separator_count}")
-
-
-# ============================================================
-# EDIT OPERATIONS
-# ============================================================
-
-operations = edit_operations(
-    reference_phonemes,
-    predicted_phonemes,
-)
-
-problem_operations = [
-    operation for operation in operations if operation["operation"] != "MATCH"
-]
-
-
-print("\n")
-print("=" * 90)
-print("2. RECOGNITION DIFFERENCES")
-print("=" * 90)
-
-if not problem_operations:
-
-    print("\nNo phoneme differences found.")
-
-else:
-
-    for index, operation in enumerate(
-        problem_operations,
-        start=1,
-    ):
-
-        op = operation["operation"]
-
-        expected = operation["reference_token"]
-
-        detected = operation["predicted_token"]
-
-        if op == "SUBSTITUTE":
-
-            print(
-                f"{index:3}. SUBSTITUTE   "
-                f"expected={expected!r}   "
-                f"detected={detected!r}"
-            )
-
-        elif op == "DELETE":
-
-            print(
-                f"{index:3}. DELETE       "
-                f"expected={expected!r}   "
-                f"detected=<missing>"
-            )
-
-        elif op == "INSERT":
-
-            print(
-                f"{index:3}. INSERT       "
-                f"expected=<none>   "
-                f"detected={detected!r}"
-            )
-
-
-# ============================================================
-# PART 2
-# FORCED ALIGNMENT
-# ============================================================
-
-print("\n")
-print("=" * 90)
-print("3. FORCED ALIGNMENT")
-print("=" * 90)
-
-print(
-    "\nThe expected phoneme sequence is forced onto"
-    "\nthe audio only to obtain timestamps."
-)
-
-log_probs = torch.log_softmax(
-    logits,
-    dim=-1,
-)
-
-
-# ============================================================
-# BUILD CTC TARGET
-# ============================================================
-
-extended = [blank_id]
-
-for token_id in alignment_target_ids:
-
-    extended.append(token_id)
-    extended.append(blank_id)
-
-extended = torch.tensor(
-    extended,
-    dtype=torch.long,
-)
-
-num_states = len(extended)
-
-NEG_INF = -float("inf")
-
-
-# ============================================================
-# VITERBI INITIALIZATION
-# ============================================================
-
-previous = torch.full(
-    (num_states,),
-    NEG_INF,
-)
-
-previous[0] = log_probs[
-    0,
-    blank_id,
-]
-
-if num_states > 1:
-
-    previous[1] = log_probs[
-        0,
-        extended[1],
-    ]
-
-
-backpointer = torch.full(
-    (
-        num_frames,
-        num_states,
-    ),
-    -1,
-    dtype=torch.int16,
-)
-
-backpointer[0, 0] = 0
-
-if num_states > 1:
-
-    backpointer[0, 1] = 0
-
-
-# ============================================================
-# VITERBI
-# ============================================================
-
-for t in range(
-    1,
-    num_frames,
-):
-
-    current = torch.full(
-        (num_states,),
-        NEG_INF,
-    )
-
-    for s in range(num_states):
-
-        token_id = extended[s]
-
-        # ----------------------------------------------------
-        # Stay
-        # ----------------------------------------------------
-
-        best_score = previous[s]
-        best_previous_state = s
-
-        # ----------------------------------------------------
-        # Move one state
-        # ----------------------------------------------------
-
-        if s > 0:
-
-            score = previous[s - 1]
-
-            if score > best_score:
-
-                best_score = score
-                best_previous_state = s - 1
-
-        # ----------------------------------------------------
-        # Skip one state
-        # ----------------------------------------------------
-
-        if s > 1:
-
-            if token_id != extended[s - 2]:
-
-                score = previous[s - 2]
-
-                if score > best_score:
-
-                    best_score = score
-                    best_previous_state = s - 2
-
-        current[s] = (
-            best_score
-            + log_probs[
-                t,
-                token_id,
-            ]
+        maximum_frames = min(
+            num_frames,
+            round(maximum_seconds / frame_duration),
         )
 
-        backpointer[
-            t,
-            s,
-        ] = best_previous_state
-
-    previous = current
+    duration_ranges_frames.append(
+        (
+            minimum_frames,
+            maximum_frames,
+        )
+    )
 
 
 # ============================================================
-# BEST FINAL STATE
+# VERSION 6 SEGMENTATION
 # ============================================================
 
-final_candidates = [
-    num_states - 1,
-    num_states - 2,
-]
+print()
+print("=" * 90)
+print("FINDING WORD BOUNDARIES")
+print("=" * 90)
 
-best_final_state = max(
-    final_candidates,
-    key=lambda state: previous[state].item(),
+max_trailing_frames = round(MAX_TRAILING_AUDIO / frame_duration)
+
+minimum_final_end_frame = max(
+    1,
+    num_frames - max_trailing_frames,
 )
 
-best_score = previous[best_final_state].item()
+num_words = len(REFERENCE_WORDS)
+
+dp = [[float("-inf")] * (num_frames + 1) for _ in range(num_words)]
+
+back = [[None] * (num_frames + 1) for _ in range(num_words)]
+
+
+# ============================================================
+# FIRST WORD
+# ============================================================
+
+minimum_frames, maximum_frames = duration_ranges_frames[0]
+
+for end_frame in range(
+    minimum_frames,
+    maximum_frames + 1,
+):
+
+    score = ctc_segment_score(
+        whole_log_probs,
+        word_token_ids[0],
+        0,
+        end_frame,
+        blank_id,
+    )
+
+    dp[0][end_frame] = score
+
+
+# ============================================================
+# REMAINING WORDS
+# ============================================================
+
+for word_index in range(
+    1,
+    num_words,
+):
+
+    minimum_frames, maximum_frames = duration_ranges_frames[word_index]
+
+    for end_frame in range(
+        1,
+        num_frames + 1,
+    ):
+
+        # Final word
+        if word_index == num_words - 1:
+
+            if end_frame < minimum_final_end_frame:
+                continue
+
+            start_min = 0
+
+            start_max = end_frame - minimum_frames
+
+        # Normal word
+        else:
+
+            start_min = max(
+                0,
+                end_frame - maximum_frames,
+            )
+
+            start_max = end_frame - minimum_frames
+
+        if start_max < start_min:
+            continue
+
+        best_score = float("-inf")
+        best_start = None
+
+        for start_frame in range(
+            start_min,
+            start_max + 1,
+        ):
+
+            previous_score = dp[word_index - 1][start_frame]
+
+            if previous_score == float("-inf"):
+                continue
+
+            current_score = ctc_segment_score(
+                whole_log_probs,
+                word_token_ids[word_index],
+                start_frame,
+                end_frame,
+                blank_id,
+            )
+
+            total_score = previous_score + current_score
+
+            if total_score > best_score:
+
+                best_score = total_score
+                best_start = start_frame
+
+        dp[word_index][end_frame] = best_score
+
+        back[word_index][end_frame] = best_start
+
+
+# ============================================================
+# BEST FINAL END
+# ============================================================
+
+best_final_score = float("-inf")
+best_final_frame = None
+
+for end_frame in range(
+    minimum_final_end_frame,
+    num_frames + 1,
+):
+
+    score = dp[-1][end_frame]
+
+    if score > best_final_score:
+
+        best_final_score = score
+        best_final_frame = end_frame
+
+
+if best_final_frame is None:
+
+    raise RuntimeError("No valid word segmentation found.")
 
 
 # ============================================================
 # BACKTRACK
 # ============================================================
 
-states = []
+boundaries = []
 
-state = best_final_state
+current_end = best_final_frame
 
-for t in range(
-    num_frames - 1,
-    -1,
-    -1,
-):
+for word_index in reversed(range(num_words)):
 
-    states.append(state)
+    if word_index == 0:
 
-    if t > 0:
-
-        state = int(
-            backpointer[
-                t,
-                state,
-            ]
-        )
-
-states.reverse()
-
-
-# ============================================================
-# EXTRACT ALIGNED SEGMENTS
-# ============================================================
-
-segments = []
-
-current_state = None
-start_frame = None
-
-for frame, state in enumerate(states):
-
-    if extended[state] == blank_id:
-
-        if current_state is not None:
-
-            segments.append(
-                (
-                    current_state,
-                    start_frame,
-                    frame,
-                )
-            )
-
-            current_state = None
-            start_frame = None
-
-        continue
-
-    if state != current_state:
-
-        if current_state is not None:
-
-            segments.append(
-                (
-                    current_state,
-                    start_frame,
-                    frame,
-                )
-            )
-
-        current_state = state
-        start_frame = frame
-
-
-if current_state is not None:
-
-    segments.append(
-        (
-            current_state,
-            start_frame,
-            num_frames,
-        )
-    )
-
-
-# ============================================================
-# CREATE ALIGNMENT OBJECTS
-# ============================================================
-
-forced_alignment = []
-
-for state, start_frame, end_frame in segments:
-
-    token_id = int(extended[state])
-
-    token = id_to_token.get(
-        token_id,
-        f"<UNK:{token_id}>",
-    )
-
-    token_log_probs = log_probs[
-        start_frame:end_frame,
-        token_id,
-    ]
-
-    confidence = torch.exp(token_log_probs.mean()).item()
-
-    forced_alignment.append(
-        TokenSegment(
-            token=token,
-            start_frame=start_frame,
-            end_frame=end_frame,
-            start_time=frame_to_time(
-                start_frame,
-                frame_duration,
-            ),
-            end_time=frame_to_time(
-                end_frame,
-                frame_duration,
-            ),
-            confidence=confidence,
-        )
-    )
-
-
-# ============================================================
-# PRINT FORCED ALIGNMENT
-# ============================================================
-
-print("\n")
-print("Forced phoneme timestamps:")
-print("-" * 90)
-
-for segment in forced_alignment:
-
-    if segment.confidence >= STRONG_THRESHOLD:
-
-        level = "STRONG"
-
-    elif segment.confidence >= WEAK_THRESHOLD:
-
-        level = "MODERATE"
+        start_frame = 0
 
     else:
 
-        level = "WEAK"
+        start_frame = back[word_index][current_end]
 
-    print(
-        f"{segment.token:>4}   "
-        f"{segment.start_time:6.2f}s -> "
-        f"{segment.end_time:6.2f}s   "
-        f"{segment.confidence * 100:6.2f}%   "
-        f"{level}"
+        if start_frame is None:
+
+            raise RuntimeError("Could not reconstruct " "word boundaries.")
+
+    boundaries.append(
+        (
+            word_index,
+            start_frame,
+            current_end,
+        )
+    )
+
+    current_end = start_frame
+
+
+boundaries.reverse()
+
+
+# ============================================================
+# BUILD BOUNDARY OBJECTS
+# ============================================================
+
+results = []
+
+for (
+    word_index,
+    start_frame,
+    end_frame,
+) in boundaries:
+
+    start_time = frame_to_seconds(
+        start_frame,
+        frame_duration,
+    )
+
+    end_time = frame_to_seconds(
+        end_frame,
+        frame_duration,
+    )
+
+    duration = end_time - start_time
+
+    score = ctc_segment_score(
+        whole_log_probs,
+        word_token_ids[word_index],
+        start_frame,
+        end_frame,
+        blank_id,
+    )
+
+    results.append(
+        WordBoundary(
+            word_index=word_index,
+            word=REFERENCE_WORDS[word_index],
+            arabic=WORD_LABELS_ARABIC[word_index],
+            start_frame=start_frame,
+            end_frame=end_frame,
+            start_time=start_time,
+            end_time=end_time,
+            duration=duration,
+            segmentation_score=score,
+        )
     )
 
 
 # ============================================================
-# PART 3
-# WORD-LEVEL FORCED TIMING
+# PRINT BOUNDARIES
 # ============================================================
 
-print("\n")
+print()
 print("=" * 90)
-print("4. WORD-LEVEL TIMING")
+print("DETECTED WORD BOUNDARIES")
 print("=" * 90)
 
+for result in results:
+
+    print()
+    print(f"{result.word_index + 1}. " f"{result.arabic}")
+
+    print(f"   " f"{result.start_time:.2f}s " f"-> " f"{result.end_time:.2f}s")
+
+    print(f"   Duration: " f"{result.duration:.2f}s")
+
+
+# ============================================================
+# INDEPENDENT WORD RECOGNITION
+# ============================================================
+
+print()
+print("=" * 90)
+print("INDEPENDENT WORD PHONETIC RECOGNITION")
+print("=" * 90)
+
+print()
+print(
+    "Each detected word segment is now analyzed " "independently by the phonetic model."
+)
 
 word_results = []
 
-alignment_position = 0
 
-for word_index, word in enumerate(REFERENCE_WORDS):
+for result in results:
 
-    word_length = len(word)
+    # --------------------------------------------------------
+    # Extract audio samples
+    # --------------------------------------------------------
 
-    word_segments = forced_alignment[
-        alignment_position : alignment_position + word_length
-    ]
+    start_sample = round(result.start_time * SAMPLE_RATE)
 
-    alignment_position += word_length
+    end_sample = round(result.end_time * SAMPLE_RATE)
 
-    if not word_segments:
-        continue
+    word_audio = audio[start_sample:end_sample]
 
-    word_start = word_segments[0].start_time
+    # --------------------------------------------------------
+    # Run the model on THIS WORD ONLY
+    # --------------------------------------------------------
 
-    word_end = word_segments[-1].end_time
+    word_inputs = processor(
+        word_audio,
+        sampling_rate=SAMPLE_RATE,
+        return_tensors="pt",
+    )
 
-    valid_confidences = [
-        segment.confidence for segment in word_segments if segment.confidence > 0
-    ]
+    with torch.no_grad():
 
-    if valid_confidences:
+        word_outputs = model(
+            input_values=(word_inputs.input_values),
+        )
 
-        word_evidence = torch.exp(
-            torch.tensor(
-                [
-                    torch.log(torch.tensor(confidence))
-                    for confidence in valid_confidences
-                ]
-            ).mean()
-        ).item()
+    word_logits = (word_outputs.logits)[0]
 
-    else:
+    # --------------------------------------------------------
+    # Unconstrained recognition
+    # --------------------------------------------------------
 
-        word_evidence = 0.0
+    detected_phonetics, confidence = decode_ctc(
+        word_logits,
+        processor,
+        blank_id,
+    )
+
+    reference = result.word
+
+    similarity = similarity_score(
+        reference,
+        detected_phonetics,
+    )
 
     word_results.append(
-        {
-            "arabic_index": word_index,
-            "word": word,
-            "start": word_start,
-            "end": word_end,
-            "confidence": word_evidence,
-            "segments": word_segments,
-        }
+        (
+            result,
+            detected_phonetics,
+            confidence,
+            similarity,
+        )
     )
 
 
-for index, word in enumerate(word_results):
+# ============================================================
+# PRINT WORD ANALYSIS
+# ============================================================
 
-    arabic_word = WORD_LABELS_ARABIC[index] if index < len(WORD_LABELS_ARABIC) else ""
+for (
+    result,
+    detected,
+    confidence,
+    similarity,
+) in word_results:
 
-    print("\n" + "-" * 90)
+    print()
+    print("-" * 90)
 
-    print(f"Word {index + 1}: " f"{arabic_word}")
+    print(f"WORD {result.word_index + 1}: " f"{result.arabic}")
 
-    print(f"Phonetics: " f"{word['word']}")
+    print(f"Time: " f"{result.start_time:.2f}s " f"-> " f"{result.end_time:.2f}s")
 
-    print(f"Time: " f"{word['start']:.2f}s -> " f"{word['end']:.2f}s")
+    print(f"Duration: " f"{result.duration:.2f}s")
 
-    print(f"Duration: " f"{word['end'] - word['start']:.2f}s")
+    print()
 
-    print(f"Forced-alignment evidence: " f"{word['confidence'] * 100:.2f}%")
+    print(f"Expected phonetics:")
+
+    print(f"  {result.word}")
+
+    print()
+
+    print(f"Detected phonetics:")
+
+    print(f"  {detected}")
+
+    print()
+
+    print(f"Model frame confidence: " f"{confidence:.2f}%")
+
+    print(f"Phonetic similarity: " f"{similarity:.2f}%")
 
 
 # ============================================================
-# PART 4
-# MAP RECOGNITION ERRORS TO TIME
+# OVERALL SUMMARY
 # ============================================================
 
-print("\n")
+print()
 print("=" * 90)
-print("5. POSSIBLE DIFFERENCE LOCATIONS")
-print("=" * 90)
-
-print(
-    "\nThese timestamps combine:"
-    "\n- unconstrained recognition"
-    "\n- reference forced alignment"
-    "\n"
-    "\nThey are candidate locations for further analysis,"
-    "\nnot confirmed Tajweed errors."
-)
-
-
-for index, operation in enumerate(
-    problem_operations,
-    start=1,
-):
-
-    op = operation["operation"]
-
-    reference_index = operation["reference_index"]
-
-    predicted_index = operation["predicted_index"]
-
-    expected = operation["reference_token"]
-
-    detected = operation["predicted_token"]
-
-    # --------------------------------------------------------
-    # Reference timestamp
-    # --------------------------------------------------------
-
-    if reference_index is not None:
-
-        if 0 <= reference_index < len(forced_alignment):
-
-            reference_segment = forced_alignment[reference_index]
-
-            time_text = (
-                f"{reference_segment.start_time:.2f}s"
-                f" -> "
-                f"{reference_segment.end_time:.2f}s"
-            )
-
-        else:
-
-            time_text = "unknown"
-
-    else:
-
-        time_text = "unknown"
-
-    # --------------------------------------------------------
-    # INSERT timestamp
-    # --------------------------------------------------------
-
-    if (
-        op == "INSERT"
-        and predicted_index is not None
-        and 0 <= predicted_index < len(predicted_segments)
-    ):
-
-        predicted_segment = predicted_segments[predicted_index]
-
-        time_text = (
-            f"{predicted_segment.start_time:.2f}s"
-            f" -> "
-            f"{predicted_segment.end_time:.2f}s"
-        )
-
-    # --------------------------------------------------------
-    # Print
-    # --------------------------------------------------------
-
-    if op == "SUBSTITUTE":
-
-        print(f"\n{index}. " f"{time_text}")
-
-        print(f"   Expected: {expected!r}")
-
-        print(f"   Model heard: {detected!r}")
-
-        print(f"   Type: POSSIBLE SUBSTITUTION")
-
-    elif op == "DELETE":
-
-        print(f"\n{index}. " f"{time_text}")
-
-        print(f"   Expected: {expected!r}")
-
-        print(f"   Model heard: nothing")
-
-        print(f"   Type: POSSIBLE OMISSION")
-
-    elif op == "INSERT":
-
-        print(f"\n{index}. " f"{time_text}")
-
-        print(f"   Expected: nothing")
-
-        print(f"   Model heard: {detected!r}")
-
-        print(f"   Type: POSSIBLE EXTRA PHONEME")
-
-
-# ============================================================
-# FINAL SUMMARY
-# ============================================================
-
-print("\n")
-print("=" * 90)
-print("FINAL SUMMARY")
+print("VERSION 7 SUMMARY")
 print("=" * 90)
 
-print("\nExpected phoneme sequence:")
+print()
 
-print(f"  {reference_phonemes}")
+print(f"Ayah duration: " f"{audio_duration:.2f}s")
 
-print("\nModel's actual phoneme sequence:")
+print()
 
-print(f"  {predicted_phonemes}")
+for (
+    result,
+    detected,
+    confidence,
+    similarity,
+) in word_results:
 
-print(f"\nRecognition edit distance:" f" {distance}")
+    print(
+        f"{result.arabic:<15} "
+        f"Expected: {result.word:<15} "
+        f"Detected: {detected:<20} "
+        f"Similarity: {similarity:6.2f}%"
+    )
 
-print(f"\nRecognition phonetic similarity:" f" {similarity * 100:.2f}%")
+print()
 
-print(f"\nNumber of recognition differences:" f" {len(problem_operations)}")
+print("IMPORTANT:")
 
-print(f"\nForced-alignment CTC score:" f" {best_score:.2f}")
+print("The similarity and confidence values are " "phonetic recognition diagnostics.")
 
-print("\nIMPORTANT:")
+print("They are NOT Tajweed correctness scores.")
 
-print(
-    "The forced alignment does NOT mean the model"
-    "\nrecognized every expected phoneme."
-)
-
-print("\nThe recognition result above is the model's" "\nunconstrained prediction.")
-
-print(
-    "\nThe forced alignment is only used to put"
-    "\nthe expected phonemes on the timeline."
-)
-
-print(
-    "\nThis is still a phonetic-analysis prototype,"
-    "\nnot yet a Tajweed grading system."
-)
-
-print("\nDone.")
+print()
+print("Done.")
